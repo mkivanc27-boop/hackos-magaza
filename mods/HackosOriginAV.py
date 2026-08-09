@@ -2,31 +2,24 @@
 # -*- coding: utf-8 -*-
 
 """
-HackosOriginAV v1.1
-Savunma odakli HackOS antivirus modu.
+HackosOriginAV v1.2
 
-Komut:
-    hackosav
+Savunma amaçlı Python statik analiz antivirüsü.
 
-Ozellikler:
-    - AST tabanli statik analiz
-    - Risk puanlama
-    - Davranis korelasyonu
-    - Obfuscation tespiti
-    - Supheli dosya/komut analizi
-    - Karantina
-    - Tarama gecmisi
-
-Not:
-Bu antivirus tek bir import veya kelimeyi otomatik olarak
-"virus" kabul etmez. Birden fazla supheli belirtiyi birlikte
-degerlendirir.
+Özellikler:
+- AST tabanlı analiz
+- Davranış korelasyonu
+- Obfuscation sinyalleri
+- Risk puanlama
+- Self-scan koruması
+- SHA-256
+- Karantina
+- Tarama geçmişi
 """
 
 import ast
 import base64
 import hashlib
-import json
 import math
 import re
 import time
@@ -35,9 +28,9 @@ from pathlib import Path
 
 META = {
     "name": "HackosOriginAV",
-    "version": "1.1",
+    "version": "1.2",
     "author": "HackOS Security",
-    "description": "Gelismis davranis ve statik analiz antivirusu.",
+    "description": "Davranış korelasyonlu Python güvenlik analizörü.",
     "permissions": [
         "dosya_okuma",
         "dosya_yazma",
@@ -46,55 +39,54 @@ META = {
 }
 
 
-# =========================================================
-# AYARLAR
-# =========================================================
-
 AV_DIR = ".HackosOriginAV"
 QUARANTINE_DIR = AV_DIR + "/quarantine"
 
 MAX_SOURCE_SIZE = 2 * 1024 * 1024
 
-RISK_CLEAN = 25
-RISK_LOW = 49
-RISK_SUSPICIOUS = 69
-RISK_HIGH = 89
 
-
-# Tek basina virus anlamina GELMEYEN importlar.
 IMPORT_SCORES = {
-    "socket": 5,
-    "requests": 5,
-    "urllib": 5,
-    "urllib3": 5,
-    "ftplib": 8,
-    "subprocess": 8,
-    "ctypes": 10,
+    "socket": 2,
+    "requests": 2,
+    "urllib": 2,
+    "urllib3": 2,
+    "ftplib": 3,
+    "subprocess": 3,
+    "ctypes": 4,
 }
 
-
-# Dinamik kod calistirma daha ciddi.
 DYNAMIC_CALLS = {
-    "eval": 18,
-    "exec": 22,
-    "compile": 12,
-    "__import__": 10,
+    "eval": 15,
+    "exec": 18,
+    "compile": 10,
+    "__import__": 8,
 }
 
-
-# HackOS API'leri tek basina zararli degildir.
-HACKOS_OPERATIONS = {
-    "delete_file": 8,
-    "rename_file": 5,
-    "write_file": 3,
-    "read_file": 2,
-    "run": 8,
+FILE_CALLS = {
+    "open": 2,
+    "os.remove": 6,
+    "os.unlink": 6,
+    "shutil.rmtree": 8,
 }
 
+NETWORK_CALLS = {
+    "requests.get",
+    "requests.post",
+    "requests.put",
+    "requests.delete",
+    "urllib.request.urlopen",
+    "socket.socket",
+}
 
-# =========================================================
-# YARDIMCI
-# =========================================================
+PROCESS_CALLS = {
+    "os.system",
+    "os.popen",
+    "subprocess.run",
+    "subprocess.Popen",
+    "subprocess.call",
+    "subprocess.check_output",
+}
+
 
 def clamp(value, low=0, high=100):
     return max(low, min(high, value))
@@ -117,7 +109,6 @@ def entropy(text):
         counts[char] = counts.get(char, 0) + 1
 
     length = len(text)
-
     result = 0.0
 
     for count in counts.values():
@@ -132,7 +123,7 @@ def entropy(text):
     return result
 
 
-def get_call_name(node):
+def call_name(node):
 
     if isinstance(node, ast.Name):
         return node.id
@@ -140,7 +131,6 @@ def get_call_name(node):
     if isinstance(node, ast.Attribute):
 
         parts = []
-
         current = node
 
         while isinstance(
@@ -148,20 +138,12 @@ def get_call_name(node):
             ast.Attribute
         ):
 
-            parts.append(
-                current.attr
-            )
-
+            parts.append(current.attr)
             current = current.value
 
-        if isinstance(
-            current,
-            ast.Name
-        ):
+        if isinstance(current, ast.Name):
 
-            parts.append(
-                current.id
-            )
+            parts.append(current.id)
 
             return ".".join(
                 reversed(parts)
@@ -170,16 +152,11 @@ def get_call_name(node):
     return ""
 
 
-# =========================================================
-# ANALIZCI
-# =========================================================
-
 class OriginScanner(ast.NodeVisitor):
 
     def __init__(self, source):
 
         self.source = source
-        self.lines = source.splitlines()
 
         self.score = 0
         self.findings = []
@@ -187,12 +164,12 @@ class OriginScanner(ast.NodeVisitor):
         self.imports = set()
         self.calls = set()
 
-        self.file_operations = 0
-        self.network_operations = 0
-        self.dynamic_operations = 0
-
+        self.dynamic = 0
+        self.network = 0
+        self.process = 0
+        self.file_ops = 0
+        self.encoded = 0
         self.long_strings = 0
-        self.encoded_strings = 0
 
     def add(
         self,
@@ -211,10 +188,6 @@ class OriginScanner(ast.NodeVisitor):
             "line": line
         })
 
-    # -----------------------------------------------------
-    # IMPORT
-    # -----------------------------------------------------
-
     def visit_Import(self, node):
 
         for item in node.names:
@@ -228,7 +201,7 @@ class OriginScanner(ast.NodeVisitor):
                 self.add(
                     IMPORT_SCORES[root],
                     "INFO",
-                    f"Supheli import: {item.name}",
+                    f"Supheli kutuphane: {item.name}",
                     node.lineno
                 )
 
@@ -237,7 +210,6 @@ class OriginScanner(ast.NodeVisitor):
     def visit_ImportFrom(self, node):
 
         module = node.module or ""
-
         root = module.split(".")[0]
 
         self.imports.add(root)
@@ -247,62 +219,57 @@ class OriginScanner(ast.NodeVisitor):
             self.add(
                 IMPORT_SCORES[root],
                 "INFO",
-                f"Supheli import: {module}",
+                f"Supheli kutuphane: {module}",
                 node.lineno
             )
 
         self.generic_visit(node)
 
-    # -----------------------------------------------------
-    # CALL
-    # -----------------------------------------------------
-
     def visit_Call(self, node):
 
-        name = get_call_name(
-            node.func
-        )
+        name = call_name(node.func)
 
-        self.calls.add(name)
+        if name:
+            self.calls.add(name)
 
         if name in DYNAMIC_CALLS:
 
-            value = DYNAMIC_CALLS[name]
-
-            self.dynamic_operations += 1
+            self.dynamic += 1
 
             self.add(
-                value,
+                DYNAMIC_CALLS[name],
                 "HIGH",
                 f"Dinamik kod calistirma: {name}",
                 node.lineno
             )
 
-        if name in HACKOS_OPERATIONS:
+        if name in NETWORK_CALLS:
 
-            self.file_operations += 1
+            self.network += 1
+
+        if name in PROCESS_CALLS:
+
+            self.process += 1
 
             self.add(
-                HACKOS_OPERATIONS[name],
-                "INFO",
-                f"HackOS islemi: {name}",
+                6,
+                "MEDIUM",
+                f"Proses/komut islemi: {name}",
                 node.lineno
             )
 
-        if name in (
-            "socket.socket",
-            "requests.get",
-            "requests.post",
-            "urllib.request.urlopen"
-        ):
+        if name in FILE_CALLS:
 
-            self.network_operations += 1
+            self.file_ops += 1
+
+            self.add(
+                FILE_CALLS[name],
+                "MEDIUM",
+                f"Dosya islemi: {name}",
+                node.lineno
+            )
 
         self.generic_visit(node)
-
-    # -----------------------------------------------------
-    # STRING
-    # -----------------------------------------------------
 
     def visit_Constant(self, node):
 
@@ -316,31 +283,21 @@ class OriginScanner(ast.NodeVisitor):
 
         text = node.value
 
-        # Cok uzun stringler bazen encoded/obfuscated
-        # payloadlarda gorulebilir.
         if len(text) >= 500:
 
             self.long_strings += 1
 
-            ent = entropy(text)
+            if entropy(text) >= 4.7:
 
-            if ent >= 4.7:
-
-                self.encoded_strings += 1
+                self.encoded += 1
 
                 self.add(
-                    10,
+                    8,
                     "MEDIUM",
-                    "Yuksek entropili uzun string",
-                    getattr(
-                        node,
-                        "lineno",
-                        0
-                    )
+                    "Yuksek entropili uzun veri",
+                    getattr(node, "lineno", 0)
                 )
 
-        # Base64 benzeri stringleri sadece
-        # suphe sinyali olarak ele al.
         compact = re.sub(
             r"\s+",
             "",
@@ -363,17 +320,13 @@ class OriginScanner(ast.NodeVisitor):
                     validate=True
                 )
 
-                self.encoded_strings += 1
+                self.encoded += 1
 
                 self.add(
-                    8,
+                    6,
                     "MEDIUM",
-                    "Base64 benzeri encoded veri",
-                    getattr(
-                        node,
-                        "lineno",
-                        0
-                    )
+                    "Base64 benzeri veri",
+                    getattr(node, "lineno", 0)
                 )
 
             except Exception:
@@ -381,77 +334,56 @@ class OriginScanner(ast.NodeVisitor):
 
         self.generic_visit(node)
 
-    # -----------------------------------------------------
-    # KORELASYON
-    # -----------------------------------------------------
-
     def correlate(self):
 
-        # Dinamik kod + encoded veri
-        if (
-            self.dynamic_operations > 0
-            and
-            self.encoded_strings > 0
-        ):
+        if self.dynamic and self.encoded:
 
             self.add(
                 25,
                 "CRITICAL",
-                "Dinamik kod + encoded veri kombinasyonu"
+                "Dinamik kod + encoded veri"
             )
 
-        # Dinamik kod + dosya islemleri
-        if (
-            self.dynamic_operations > 0
-            and
-            self.file_operations >= 2
-        ):
+        if self.dynamic and self.network:
 
             self.add(
                 20,
                 "HIGH",
-                "Dinamik kod + coklu dosya islemi"
+                "Ag + dinamik kod kombinasyonu"
             )
 
-        # Ag + dinamik kod
-        if (
-            self.network_operations > 0
-            and
-            self.dynamic_operations > 0
-        ):
+        if self.dynamic and self.process:
 
             self.add(
-                20,
+                18,
                 "HIGH",
-                "Ag islemi + dinamik kod kombinasyonu"
+                "Dinamik kod + proses islemi"
             )
 
-        # Ag + coklu dosya islemi
-        if (
-            self.network_operations > 0
-            and
-            self.file_operations >= 3
-        ):
+        if self.network and self.process:
 
             self.add(
                 15,
+                "HIGH",
+                "Ag + proses islemi"
+            )
+
+        if self.network and self.file_ops >= 3:
+
+            self.add(
+                12,
                 "MEDIUM",
                 "Ag + coklu dosya islemi"
             )
 
-        # Cok fazla HackOS dosya islemi
-        if self.file_operations >= 8:
+        if self.process >= 3:
 
             self.add(
-                15,
+                10,
                 "MEDIUM",
-                "Yuksek miktarda dosya islemi"
+                "Birden fazla proses islemi"
             )
 
-
-# =========================================================
-# ANTIVIRUS
-# =========================================================
 
 class HackosOriginAV:
 
@@ -463,26 +395,18 @@ class HackosOriginAV:
         self.threats = 0
 
         self.last_scan = None
-
         self.history = []
-
-    # -----------------------------------------------------
-    # OKUMA
-    # -----------------------------------------------------
 
     def read_file(self, path):
 
         try:
 
-            source = self.api.read_file(
-                path
-            )
+            source = self.api.read_file(path)
 
             if source is None:
                 return None
 
             if len(source) > MAX_SOURCE_SIZE:
-
                 return None
 
             return source
@@ -491,18 +415,19 @@ class HackosOriginAV:
 
             return None
 
-    # -----------------------------------------------------
-    # TEK DOSYA
-    # -----------------------------------------------------
+    def is_self(self, path):
 
-    def scan_file(
-        self,
-        path
-    ):
+        try:
 
-        source = self.read_file(
-            path
-        )
+            return Path(path).name.lower() == "hackosoriginav.py"
+
+        except Exception:
+
+            return False
+
+    def scan_file(self, path):
+
+        source = self.read_file(path)
 
         if source is None:
 
@@ -519,17 +444,16 @@ class HackosOriginAV:
                 ]
             }
 
-        # AV'nin kendisini tararken
-        # kendi detection listelerini analiz etme.
-        if (
-            Path(path).name.lower()
-            == "hackosoriginav.py"
-        ):
+        # KENDİ KAYNAK KODUNU ANALİZ ETME.
+        # Detection stringleri kendi içinde bulunduğu
+        # için false-positive oluşmasını engeller.
+        if self.is_self(path):
 
             return {
                 "path": path,
                 "score": 0,
                 "status": "GUVENILIR",
+                "hash": sha256_text(source),
                 "findings": [
                     {
                         "level": "INFO",
@@ -552,8 +476,9 @@ class HackosOriginAV:
 
             return {
                 "path": path,
-                "score": 20,
+                "score": 15,
                 "status": "SUPHELI",
+                "hash": sha256_text(source),
                 "findings": [
                     {
                         "level": "INFO",
@@ -570,12 +495,9 @@ class HackosOriginAV:
                 ]
             }
 
-        scanner = OriginScanner(
-            source
-        )
+        scanner = OriginScanner(source)
 
         scanner.visit(tree)
-
         scanner.correlate()
 
         score = clamp(
@@ -583,23 +505,18 @@ class HackosOriginAV:
         )
 
         if score >= 90:
-
             status = "KRITIK"
 
         elif score >= 70:
-
             status = "YUKSEK"
 
         elif score >= 50:
-
             status = "SUPHELI"
 
         elif score >= 25:
-
             status = "DUSUK_RISK"
 
         else:
-
             status = "TEMIZ"
 
         return {
@@ -610,14 +527,7 @@ class HackosOriginAV:
             "findings": scanner.findings
         }
 
-    # -----------------------------------------------------
-    # KLASOR
-    # -----------------------------------------------------
-
-    def scan_directory(
-        self,
-        directory
-    ):
+    def scan_directory(self, directory):
 
         results = []
 
@@ -633,10 +543,9 @@ class HackosOriginAV:
 
         for name in files:
 
-            if not name.endswith(
+            if not name.lower().endswith(
                 ".py"
             ):
-
                 continue
 
             path = (
@@ -645,19 +554,11 @@ class HackosOriginAV:
                 + name
             )
 
-            result = self.scan_file(
-                path
-            )
-
             results.append(
-                result
+                self.scan_file(path)
             )
 
         return results
-
-    # -----------------------------------------------------
-    # TAM TARAMA
-    # -----------------------------------------------------
 
     def full_scan(self):
 
@@ -666,23 +567,20 @@ class HackosOriginAV:
 
         print()
         print(
-            "╔══════════════════════════════════════╗"
+            "=========================================="
         )
         print(
-            "║      🛡️ HACKOSORIGINAV v1.1          ║"
+            "       HACKOSORIGINAV v1.2 TARAMA"
         )
         print(
-            "║         DERIN TARAMA                ║"
-        )
-        print(
-            "╚══════════════════════════════════════╝"
+            "=========================================="
         )
         print()
 
         results = []
 
         print(
-            "  [1/2] Modlar analiz ediliyor..."
+            "  [1/2] Modlar taraniyor..."
         )
 
         results += self.scan_directory(
@@ -690,7 +588,7 @@ class HackosOriginAV:
         )
 
         print(
-            "  [2/2] Eklentiler analiz ediliyor..."
+            "  [2/2] Eklentiler taraniyor..."
         )
 
         results += self.scan_directory(
@@ -701,13 +599,8 @@ class HackosOriginAV:
 
         for result in results:
 
-            score = result[
-                "score"
-            ]
-
-            status = result[
-                "status"
-            ]
+            score = result["score"]
+            status = result["status"]
 
             if status in (
                 "KRITIK",
@@ -715,7 +608,6 @@ class HackosOriginAV:
             ):
 
                 symbol = "!"
-
                 self.threats += 1
 
             elif status == "SUPHELI":
@@ -732,27 +624,21 @@ class HackosOriginAV:
 
             print(
                 f"  [{symbol}] "
-                f"{result['path']}"
-                f"  Risk: {score}/100"
-                f"  [{status}]"
+                f"{result['path']} "
+                f"Risk: {score}/100 "
+                f"[{status}]"
             )
 
-            for finding in result[
-                "findings"
-            ]:
+            for finding in result["findings"]:
 
-                if finding[
-                    "level"
-                ] in (
+                if finding["level"] in (
                     "HIGH",
                     "CRITICAL"
                 ):
 
                     print(
                         "       └─ "
-                        + finding[
-                            "message"
-                        ]
+                        + finding["message"]
                     )
 
         self.last_scan = time.strftime(
@@ -769,27 +655,23 @@ class HackosOriginAV:
 
         print()
         print(
-            "----------------------------------------"
+            "------------------------------------------"
         )
         print(
-            f"  Taranan dosya : {len(results)}"
+            f"  Dosya: {len(results)}"
         )
         print(
-            f"  Yuksek/Kritik : {self.threats}"
+            f"  Tehdit: {self.threats}"
         )
         print(
-            f"  Tarama zamani : {self.last_scan}"
+            f"  Zaman: {self.last_scan}"
         )
         print(
-            "----------------------------------------"
+            "------------------------------------------"
         )
         print()
 
         return results
-
-    # -----------------------------------------------------
-    # DOSYA TARA
-    # -----------------------------------------------------
 
     def single_scan(self):
 
@@ -798,12 +680,9 @@ class HackosOriginAV:
         ).strip()
 
         if not path:
-
             return
 
-        result = self.scan_file(
-            path
-        )
+        result = self.scan_file(path)
 
         print()
         print(
@@ -816,11 +695,7 @@ class HackosOriginAV:
             f"  Durum : {result['status']}"
         )
 
-        print()
-
-        for finding in result[
-            "findings"
-        ]:
+        for finding in result["findings"]:
 
             print(
                 f"  [{finding['level']}] "
@@ -829,36 +704,29 @@ class HackosOriginAV:
 
         print()
 
-    # -----------------------------------------------------
-    # KARANTINA
-    # -----------------------------------------------------
-
     def quarantine(self):
 
         path = input(
-            "\n  Dosya yolu: "
+            "\n  Karantinaya alinacak dosya: "
         ).strip()
 
         if not path:
-
             return
 
-        result = self.scan_file(
-            path
-        )
+        result = self.scan_file(path)
 
         if result["score"] < 70:
 
             print(
-                "\n  [!] Bu dosya karantina esiginde degil."
+                "\n  [!] Dosya karantina esiginde degil."
             )
 
             return
 
-        print()
         print(
-            f"  TEHDIT: {result['status']}"
+            f"\n  TEHDIT: {result['status']}"
         )
+
         print(
             f"  Risk: {result['score']}/100"
         )
@@ -878,14 +746,11 @@ class HackosOriginAV:
         try:
 
             self.api.write_file(
-                QUARANTINE_DIR
-                + "/.keep",
+                QUARANTINE_DIR + "/.keep",
                 ""
             )
 
-            filename = Path(
-                path
-            ).name
+            filename = Path(path).name
 
             target = (
                 QUARANTINE_DIR
@@ -899,24 +764,19 @@ class HackosOriginAV:
                 target
             )
 
-            print()
             print(
-                "  🛡️ KARANTINA BASARILI"
+                "\n  KARANTINA BASARILI"
             )
+
             print(
                 f"  -> {target}"
             )
-            print()
 
         except Exception as error:
 
             print(
-                f"\n  [!] Karantina hatasi: {error}\n"
+                f"\n  [!] Karantina hatasi: {error}"
             )
-
-    # -----------------------------------------------------
-    # GECMIS
-    # -----------------------------------------------------
 
     def show_history(self):
 
@@ -946,9 +806,28 @@ class HackosOriginAV:
         )
         print()
 
-    # -----------------------------------------------------
-    # MENU
-    # -----------------------------------------------------
+    def status(self):
+
+        print()
+        print(
+            "========== HACKOS AV DURUM =========="
+        )
+        print(
+            f"  Surum       : v{META['version']}"
+        )
+        print(
+            f"  Son tarama  : {self.last_scan or 'Yok'}"
+        )
+        print(
+            f"  Son dosya   : {self.scanned}"
+        )
+        print(
+            f"  Tehdit      : {self.threats}"
+        )
+        print(
+            "======================================"
+        )
+        print()
 
     def menu(self):
 
@@ -959,7 +838,7 @@ class HackosOriginAV:
                 "╔════════════════════════════════════╗"
             )
             print(
-                "║       🛡️ HACKOSORIGINAV v1.1       ║"
+                "║       HACKOSORIGINAV v1.2          ║"
             )
             print(
                 "╠════════════════════════════════════╣"
@@ -980,10 +859,6 @@ class HackosOriginAV:
                 "║  5. 📋 Tarama Gecmisi              ║"
             )
             print(
-                          print(
-                "║  5. 📋 Tarama Gecmisi              ║"
-            )
-            print(
                 "║  6. ℹ️ Durum                        ║"
             )
             print(
@@ -999,57 +874,7 @@ class HackosOriginAV:
 
             if choice == "1":
 
-                print(
-                    "\n  [*] Hizli tarama baslatiliyor..."
-                )
-
-                results = []
-
-                results += self.scan_directory(
-                    "mods"
-                )
-
-                results += self.scan_directory(
-                    "eklentiler"
-                )
-
-                threats = 0
-
-                for result in results:
-
-                    if result["score"] >= 70:
-
-                        threats += 1
-
-                    print(
-                        f"  [{result['status']}] "
-                        f"{result['path']} "
-                        f"Risk: {result['score']}/100"
-                    )
-
-                self.scanned = len(results)
-                self.threats = threats
-                self.last_scan = time.strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                )
-
-                self.history.append({
-                    "time": self.last_scan,
-                    "files": len(results),
-                    "threats": threats
-                })
-
-                self.history = self.history[-20:]
-
-                print()
-                print(
-                    f"  [✓] Hizli tarama tamamlandi."
-                )
-                print(
-                    f"  Dosya: {len(results)} | "
-                    f"Yuksek/Kritik: {threats}"
-                )
-                print()
+                self.full_scan()
 
             elif choice == "2":
 
@@ -1069,62 +894,26 @@ class HackosOriginAV:
 
             elif choice == "6":
 
-                print()
-                print(
-                    "  🛡️ HackosOriginAV v1.1"
-                )
-                print(
-                    "  Durum: AKTIF"
-                )
-                print(
-                    "  Motor: AST + Davranis Korelasyonu"
-                )
-                print(
-                    "  Tarama limiti: "
-                    f"{MAX_SOURCE_SIZE // 1024} KB"
-                )
-                print(
-                    "  Son tarama: "
-                    + (
-                        self.last_scan
-                        or "Yok"
-                    )
-                )
-                print(
-                    "  Bu oturum taranan: "
-                    f"{self.scanned} dosya"
-                )
-                print(
-                    "  Bu oturum tehdit: "
-                    f"{self.threats}"
-                )
-                print()
+                self.status()
 
             elif choice == "0":
 
-                print(
-                    "\n  HackosOriginAV kapatildi."
-                )
                 break
 
             else:
 
                 print(
-                    "\n  [!] Gecersiz secim."
+                    "  [!] Gecersiz secim."
                 )
 
-
-# =========================================================
-# HACKOS MOD GIRISI
-# =========================================================
 
 def setup(api):
 
     av = HackosOriginAV(api)
 
-    @api.add_command(
+    @api.command(
         name="hackosav",
-        description="HackosOriginAV antivirus menusu"
+        description="HackOSOriginAV antivirus menusu"
     )
     def hackosav(*args):
 
